@@ -1,0 +1,600 @@
+import re
+import sqlite3
+import pandas
+import tabulate
+#import model_gg
+"""from random_forest_helper import train_and_score_random_forest, show_ml_table
+from start_kit import seed_sample_devices"""
+
+conn = sqlite3.connect("part2.db")
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS devices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hostname TEXT,
+    os_version TEXT,
+    model TEXT,
+    serial_number TEXT,
+    device_uptime TEXT,
+    software TEXT,
+    software_version TEXT,
+    ssh_enabled INTEGER,
+    telnet_enabled INTEGER,
+    aaa_enabled INTEGER,
+    syslog_configured INTEGER )
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS interfaces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id INTEGER,
+    interface_name TEXT,
+    access_or_trunk TEXT,
+    native_vlan INTEGER,
+    allowed_vlan TEXT,
+    up_or_down TEXT,
+    port_security_enabled INTEGER,
+    bpdu_guard_enabled INTEGER,
+    FOREIGN KEY (device_id) REFERENCES devices(id))
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS vlan (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id INTEGER,
+    vlan_number INTEGER,
+    vlan_name TEXT,
+    vlan_status TEXT,
+    FOREIGN KEY (device_id) REFERENCES devices(id))
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS raw_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id INTEGER,
+    command_type TEXT,
+    raw_text TEXT,
+    FOREIGN KEY (device_id) REFERENCES devices(id))
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id INTEGER,
+    interface_id INTEGER,
+    issue_type TEXT,
+    severity TEXT,
+    evidence TEXT,
+    recommended_fix TEXT,
+    FOREIGN KEY (device_id) REFERENCES devices(id),
+    FOREIGN KEY (interface_id) REFERENCES interfaces(id)
+
+    )""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS ml_risk_score (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id INTEGER,
+        predicted_response INTEGER,
+        mcc_score REAL,
+        risk_level TEXT,
+        model_version TEXT,
+        FOREIGN KEY (device_id) REFERENCES devices(id)
+    )""")
+conn.commit()
+
+
+def get_input(text):
+    print(f"ENTER {text} OUTPUT:")
+    print("Type 'done' to proceed")
+    lines = []
+    while True:
+        line = input(":")
+        if line.strip().lower() == "done":
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def get_match(pattern, text, flags=0):
+    match = re.search(pattern, text, flags)
+    return match.group(1) if match else None
+
+
+def pull_show_version(output):
+    # hostname, os_version, model, serial-number,uptime, software version, software
+    hostname = get_match(r"^(\S+)\s+uptime is", output, re.MULTILINE)
+    uptime = get_match(r"^\S+\s+uptime is\s+(.+)$", output, re.MULTILINE)
+
+    os_version = get_match(r"(Cisco IOS Software)", output)
+    software_version = get_match(r"\(([^)]+)\),\s+Version", output)
+
+    model = get_match(r"^Model number\s*:\s*(\S+)", output, re.MULTILINE)
+    serial_number = get_match(r"^System serial number\s*:\s*(\S+)", output, re.MULTILINE)
+    software = get_match(r'^System image file is "([^"]+)"', output, re.MULTILINE)
+
+    return {
+        "hostname": hostname,
+        "os_version": os_version,
+        "model": model,
+        "serial_number": serial_number,
+
+        "device_uptime": uptime,
+
+        "software": software,
+        "software_version": software_version,
+
+        "ssh_enabled": 0,
+        "telnet_enabled": 0,
+        "aaa_enabled": 0,
+        "syslog_configured": 0
+    }
+
+
+def pull_show_vlan_brief(output):
+    # vlan-name, vlan-number, vlan-status
+    vlans = []
+
+    pattern = re.findall(r"^\s*(\d+)\s+([\w\-]+)\s+(\S+)", output, re.MULTILINE)
+
+    for match in pattern:
+        vlan_number = int(match[0])
+        vlan_name = match[1]
+        vlan_status = match[2]
+
+        vlans.append({
+            "vlan_number": vlan_number,
+            "vlan_name": vlan_name,
+            "vlan_status": vlan_status
+        })
+    return vlans
+
+
+def pull_show_interface(output):
+    interfaces = []
+    # interface name, access or trunk, native vlan, allowed vlan,  up or down, port security
+
+    blocks = re.split(r"\n(?=\S+ is (?:up|down), line protocol)", output)
+    for block in blocks:
+        interface_name = None
+        access_or_trunk = None
+        native_vlan = None
+        allowed_vlan = None
+        up_or_down = None
+        port_security_enabled = 0
+        bpdu_guard_enabled = 0
+
+        match = re.search(r"^(\S+) is (\w+)", block)
+        if match:
+            interface_name = match.group(1)
+            up_or_down = match.group(2)
+        else:
+            continue
+        if "trunk" in block.lower():
+            access_or_trunk = "trunk"
+        else:
+            access_or_trunk = "access"
+
+        native = re.search(r"Native VLAN:\s*(\d+)", block, re.IGNORECASE)
+        if native:
+            native_vlan = native.group(1)
+
+        allowed = re.search(r"allowed vlan[s]?:\s*([\d,]+)", block, re.IGNORECASE)
+        if allowed:
+            allowed_vlan = allowed.group(1)
+
+        if "port-security" in block.lower():
+            port_security_enabled = 1
+
+        interfaces.append({
+            "interface_name": interface_name,
+            "access_or_trunk": access_or_trunk,
+            "native_vlan": native_vlan,
+            "allowed_vlan": allowed_vlan,
+            "up_or_down": up_or_down,
+
+            "port_security_enabled": port_security_enabled,
+            "bpdu_guard_enabled": bpdu_guard_enabled
+        })
+    return interfaces
+
+
+def pull_show_running_config(output):
+    # global: ssh, telnet, aaa, syslog
+    # interface blocks: access_or_trunk, native_vlan, allowed_vlan, port_security, bpdu_guard
+
+    ssh_enabled = 1 if re.search(r"ip ssh version", output) else 0
+
+    telnet_enabled = 0
+    vty_block = re.search(r"line vty[\s\S]*?(?=^!|^line|\Z)", output, re.MULTILINE)
+    if vty_block:
+        if "telnet" in vty_block.group(0).lower():
+            telnet_enabled = 1
+
+    aaa_enabled = 1 if "aaa new-model" in output else 0
+    syslog_enabled = 1 if re.search(r"logging host", output) else 0
+
+    interfaces = []
+
+    blocks = re.findall(r"^interface (\S+)([\s\S]*?)(?=^!|^interface |\Z)", output, re.MULTILINE)
+    for name, block in blocks:
+        access_or_trunk = None
+        native_vlan = None
+        allowed_vlan = None
+        port_security_enabled = 0
+        bpdu_guard_enabled = 0
+
+        if "switchport mode trunk" in block:
+            access_or_trunk = "trunk"
+        elif "switchport mode access" in block:
+            access_or_trunk = "access"
+
+        native_match = re.search(r"switchport trunk native vlan (\d+)", block)
+        if native_match:
+            native_vlan = native_match.group(1)
+
+        allowed_match = re.search(r"switchport trunk allowed vlan ([\d,]+)", block)
+        if allowed_match:
+            allowed_vlan = allowed_match.group(1)
+
+        if "switchport port-security" in block:
+            port_security_enabled = 1
+
+        if "spanning-tree bpduguard enable" in block:
+            bpdu_guard_enabled = 1
+
+        interfaces.append({
+            "interface_name": name,
+            "access_or_trunk": access_or_trunk,
+            "native_vlan": native_vlan,
+            "allowed_vlan": allowed_vlan,
+
+            "port_security_enabled": port_security_enabled,
+            "bpdu_guard_enabled": bpdu_guard_enabled
+        })
+
+    return {
+        "ssh_enabled": ssh_enabled,
+        "telnet_enabled": telnet_enabled,
+        "aaa_enabled": aaa_enabled,
+        "syslog_enabled": syslog_enabled,
+        "interfaces": interfaces
+    }
+
+
+def insert_to_db(table, data):
+    columns = ", ".join(data.keys())
+    placeholders = ", ".join(["?"] * len(data))
+    values = tuple(data.values())
+
+    query = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
+    cursor.execute(query, values)
+    conn.commit()
+
+
+def insert_many(table, rows):
+    for row in rows:
+        insert_to_db(table, row)
+
+
+def insert_raw_config(device_id, command_type, raw_text):
+    cursor.execute("""
+        INSERT INTO raw_config (device_id, command_type, raw_text)
+        VALUES (?, ?, ?)
+    """, (device_id, command_type, raw_text))
+    conn.commit()
+
+
+def update_device_from_running_config(device_id, rc_data):
+    cursor.execute("""
+        UPDATE devices
+        SET ssh_enabled = ?,
+            telnet_enabled = ?,
+            aaa_enabled = ?,
+            syslog_configured = ?
+        WHERE id = ?
+    """, (
+        rc_data["ssh_enabled"],
+        rc_data["telnet_enabled"],
+        rc_data["aaa_enabled"],
+        rc_data["syslog_enabled"],
+        device_id
+    ))
+    conn.commit()
+
+
+def update_interface(device_id, interface_data):
+    cursor.execute("""
+        UPDATE interfaces
+        SET access_or_trunk = ?,
+            native_vlan = ?,
+            allowed_vlan = ?,
+            port_security_enabled = ?,
+            bpdu_guard_enabled = ?
+        WHERE device_id = ? AND interface_name = ?
+    """, (
+        interface_data["access_or_trunk"],
+        interface_data["native_vlan"],
+        interface_data["allowed_vlan"],
+        interface_data["port_security_enabled"],
+        interface_data["bpdu_guard_enabled"],
+        device_id,
+        interface_data["interface_name"]
+    ))
+    conn.commit()
+
+
+def show_table(table_name):
+    cursor.execute(f"SELECT * FROM {table_name}")
+    rows = cursor.fetchall()
+
+    if not rows:
+        print(f"\nNo data found in {table_name}")
+        return
+
+    headers = [description[0] for description in cursor.description]
+    print(f"\n--- {table_name.upper()} ---")
+    print(tabulate.tabulate(rows, headers=headers, tablefmt="grid"))
+
+
+def show_useful_tables():
+    show_table("devices")
+    show_table("interfaces")
+    show_table("vlan")
+    show_table("ml_risk_score")
+
+
+def main():
+    show_version_output = get_input("show version")
+    show_vlan_output = get_input("show vlan brief")
+    show_interface_output = get_input("show interface")
+    show_run_output = get_input("show running config")
+
+    device_data = pull_show_version(show_version_output)
+    insert_to_db("devices", device_data)
+    device_id = cursor.lastrowid
+
+    insert_raw_config(device_id, "show version", show_version_output)
+    insert_raw_config(device_id, "show vlan brief", show_vlan_output)
+    insert_raw_config(device_id, "show interface", show_interface_output)
+    insert_raw_config(device_id, "show running config", show_run_output)
+
+    vlans = pull_show_vlan_brief(show_vlan_output)
+    for vlan in vlans:
+        vlan["device_id"] = device_id
+    insert_many("vlan", vlans)
+
+    interfaces = pull_show_interface(show_interface_output)
+    for interface in interfaces:
+        interface["device_id"] = device_id
+    insert_many("interfaces", interfaces)
+
+    rc_data = pull_show_running_config(show_run_output)
+
+    update_device_from_running_config(device_id, rc_data)
+
+    for interface in rc_data["interfaces"]:
+        update_interface(device_id, interface)
+
+    print("\nData inserted successfully.")
+
+
+def export_csv():
+    conn = sqlite3.connect("part2.db")
+    tables = pandas.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
+    for table in tables['name']:
+        df = pandas.read_sql_query(f"SELECT * FROM {table}", conn)
+        df.to_csv(f"{table}.csv", index=False)
+
+    conn.close()
+
+
+def clear_tables():
+    yon = input("CONFIRM DELETE TABLES (Y/N): ")
+    if yon.strip().lower() == "y":
+        cursor.execute("DELETE FROM devices")
+        cursor.execute("DELETE FROM interfaces")
+        cursor.execute("DELETE FROM vlan")
+        cursor.execute("DELETE FROM raw_config")
+        cursor.execute("DELETE FROM findings")
+        cursor.execute("DELETE FROM ml_risk_score")
+        conn.commit()
+        print("Tables cleared.")
+
+
+def insert_finding(device_id, interface_id, issue_type, severity, evidence, reccommended_fix):
+    cursor.execute("""
+    INSERT INTO findings (
+        device_id,
+        interface_id,
+        issue_type,
+        severity,
+        evidence,
+        recommended_fix
+        ) VALUES (?, ?, ?, ?, ?, ?)""", (
+        device_id,
+        interface_id,
+        issue_type,
+        severity,
+        evidence,
+        reccommended_fix
+    ))
+    conn.commit()
+
+
+def compliant_rating():
+    # Optional: clear old findings first so you do not duplicate results every run
+    cursor.execute("DELETE FROM findings")
+    conn.commit()
+
+    # normal checking
+    cursor.execute("""
+        SELECT id, hostname, ssh_enabled, telnet_enabled, aaa_enabled, syslog_configured
+        FROM devices
+    """)
+    devices = cursor.fetchall()
+
+    for device in devices:
+        device_id = device[0]
+        hostname = device[1]
+        ssh_enabled = device[2]
+        telnet_enabled = device[3]
+        aaa_enabled = device[4]
+        syslog_configured = device[5]
+
+        if ssh_enabled == 0:
+            insert_finding(
+                device_id=device_id,
+                interface_id=None,
+                issue_type="SSH Disabled",
+                severity="HIGH",
+                evidence=f"{hostname}: SSH is not enabled.",
+                reccommended_fix="Enable SSH and disable insecure remote management methods."
+            )
+
+        if telnet_enabled == 1:
+            insert_finding(
+                device_id=device_id,
+                interface_id=None,
+                issue_type="Telnet Enabled",
+                severity="HIGH",
+                evidence=f"{hostname}: Telnet is enabled on VTY lines.",
+                reccommended_fix="Disable Telnet and allow SSH only on VTY lines."
+            )
+
+        if aaa_enabled == 0:
+            insert_finding(
+                device_id=device_id,
+                interface_id=None,
+                issue_type="AAA Disabled",
+                severity="MEDIUM",
+                evidence=f"{hostname}: aaa new-model is not configured.",
+                reccommended_fix="Enable AAA for centralized authentication, authorization, and accounting."
+            )
+
+        if syslog_configured == 0:
+            insert_finding(
+                device_id=device_id,
+                interface_id=None,
+                issue_type="Syslog Not Configured",
+                severity="MEDIUM",
+                evidence=f"{hostname}: No syslog host is configured.",
+                reccommended_fix="Configure centralized logging with a syslog server."
+            )
+
+    # interface checking
+    cursor.execute("""
+        SELECT id, device_id, interface_name, access_or_trunk, native_vlan,
+               allowed_vlan, up_or_down, port_security_enabled, bpdu_guard_enabled
+        FROM interfaces
+    """)
+    interfaces = cursor.fetchall()
+
+    for interface in interfaces:
+        interface_id = interface[0]
+        device_id = interface[1]
+        interface_name = interface[2]
+        access_or_trunk = interface[3]
+        native_vlan = interface[4]
+        allowed_vlan = interface[5]
+        up_or_down = interface[6]
+        port_security_enabled = interface[7]
+        bpdu_guard_enabled = interface[8]
+
+        if access_or_trunk == "trunk" and native_vlan == 1:
+            insert_finding(
+                device_id=device_id,
+                interface_id=interface_id,
+                issue_type="Default Native VLAN",
+                severity="HIGH",
+                evidence=f"{interface_name}: trunk port is using native VLAN 1.",
+                reccommended_fix="Change the native VLAN to a dedicated unused VLAN."
+            )
+
+        if access_or_trunk == "trunk" and (allowed_vlan is None or allowed_vlan.strip() == ""):
+            insert_finding(
+                device_id=device_id,
+                interface_id=interface_id,
+                issue_type="Trunk Allowed VLANs Not Restricted",
+                severity="HIGH",
+                evidence=f"{interface_name}: trunk port does not have an explicit allowed VLAN list.",
+                reccommended_fix="Restrict trunk ports to only the VLANs that are required."
+            )
+
+        if access_or_trunk == "access" and port_security_enabled == 0:
+            insert_finding(
+                device_id=device_id,
+                interface_id=interface_id,
+                issue_type="Port Security Disabled",
+                severity="MEDIUM",
+                evidence=f"{interface_name}: access port does not have port security enabled.",
+                reccommended_fix="Enable switchport port-security on user-facing access ports."
+            )
+
+        if access_or_trunk == "access" and bpdu_guard_enabled == 0:
+            insert_finding(
+                device_id=device_id,
+                interface_id=interface_id,
+                issue_type="BPDU Guard Disabled",
+                severity="MEDIUM",
+                evidence=f"{interface_name}: access port does not have BPDU guard enabled.",
+                reccommended_fix="Enable spanning-tree bpduguard on edge/access ports."
+            )
+
+        if access_or_trunk == "access" and up_or_down == "down" and port_security_enabled == 0:
+            insert_finding(
+                device_id=device_id,
+                interface_id=interface_id,
+                issue_type="Unused Access Port Not Secured",
+                severity="LOW",
+                evidence=f"{interface_name}: down access port has no port security.",
+                reccommended_fix="Disable unused ports and place them in an unused VLAN."
+            )
+
+    print("\nCompliance findings generated.")
+    show_table("findings")
+
+
+def sql_manipulation():
+    pass
+
+"""
+def run_ml_model():
+    print("\nRunning Random Forest model")
+    model_gg.store_predictions(conn)
+"""
+
+
+def menu_uu():
+    menu_options = {
+        1: show_useful_tables,
+        2: clear_tables,
+        3: main,
+        4: export_csv,
+        5: compliant_rating,
+
+        6: exit
+    }
+
+    while True:
+        print("\n----NETWORK COMPLIANCE-ING-----")
+        print("1-Show current tables")
+        print("2-Clear current tables.")
+        print("3-INPUT CONFIGS.")
+        print("4-Export Tables as CSV.")
+        print("5-View compliance Issues.")
+        #print("6-Run ML Risk Analysis")
+        #print("7-SQL Table Manipulation.")
+        #print("8-Import fake data for ML")
+        print("6-Exit")
+        print("===================================")
+
+        try:
+            user_input = int(input("Choose number [1-6]: "))
+            chosen = menu_options.get(user_input)
+
+            if chosen:
+                chosen()
+            else:
+                print("Invalid option")
+
+        except ValueError:
+            print("\n>>>> TRY AGAIN, ENTER A NUMBER 1-7 <<<<")
+
+
+menu_uu()
